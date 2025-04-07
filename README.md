@@ -10,6 +10,9 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
 - **Easy to Use**: Fly.io has a simple CLI and web interface, so you can deploy your challenges with just a few commands.
 - **Free Allowance**: You don't need to pay if your usage is under $5 per month and you can start for free.
 
+## Cons
+- **Cold Start**: The first request to your challenge may take a few seconds to start up, as the machine needs to be started. But subsequent requests will be much faster.
+
 ## Getting Started
 
 1. Create a Fly.io account
