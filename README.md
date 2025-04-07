@@ -12,8 +12,9 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
 
 ## Getting Started
 
-1. Install the Fly.io CLI: https://fly.io/docs/getting-started/installing-flyctl/
 1. Create a Fly.io account
+1. Install the Fly.io CLI: https://fly.io/docs/getting-started/installing-flyctl/
+1. Login to your Fly.io account with `fly auth login`
 1. Clone this repository
 1. Run `fly launch --no-deploy` to create a new Fly.io app
 1. Run `fly volumes create data --region sin` to create a new volume
