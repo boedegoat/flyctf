@@ -6,7 +6,7 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
 
 - **Low Cost**: Fly.io autostop machines when not in use (by default after 5 mins of idle), so you only pay for what you use.
 - **Docker Based**: Everything is based on Docker, even the main VM.
-- **SSL**: Fly.io provides free SSL certificates for your challenges.
+- **SSL**: Fly.io provides free SSL certificates for your challenges out of the box.
 - **Easy to Use**: Fly.io has a simple CLI and web interface, so you can deploy your challenges with just a few commands.
 - **Free Allowance**: You don't need to pay if your usage is under $5 per month and you can start for free.
 
