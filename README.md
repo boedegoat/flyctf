@@ -20,7 +20,7 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
 1. Login to your Fly.io account with `fly auth login`
 1. Clone this repository
 1. Run `fly launch --no-deploy` to create a new Fly.io app
-1. Run `fly volumes create data --region sin` to create a new volume
+1. Run `fly volumes create data --size 10 --region sin` to create a new 10gb of persisted storage. This is crucial to avoid redownloading images/layers constantly
 1. Run `fly deploy` to deploy
 
 ## Deploying a new challenge
