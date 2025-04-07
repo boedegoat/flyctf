@@ -44,6 +44,7 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
     port = 5000 # based on public_port in challenge.yml
     handlers = ['tls', 'http']
     ```
+1. Deploy your challenge with `fly deploy`
 1. You can always refer to the current `challenges` directory for examples of how to build your own challenges
 
 ## Monitoring
