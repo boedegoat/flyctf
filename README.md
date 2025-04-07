@@ -34,13 +34,13 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
     tcp_checks = []
     script_checks = []
     protocol = 'tcp'
-    internal_port = 5000 # Open port to public
-    auto_stop_machines = 'stop'
+    internal_port = 5000 # based on public_port in challenge.yml
+    auto_stop_machines = 'stop' # stop machines after 5 mins of idle
     auto_start_machines = true
     min_machines_running = 0
 
     [[services.ports]]
-    port = 5000 # Open port to public
+    port = 5000 # based on public_port in challenge.yml
     handlers = ['tls', 'http']
     ```
 1. You can always refer to the current `challenges` directory for examples of how to build your own challenges
