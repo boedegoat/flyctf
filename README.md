@@ -8,7 +8,7 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
 - **Docker Based**: Everything is based on Docker, even the main VM.
 - **SSL**: Fly.io provides free SSL certificates for your challenges.
 - **Easy to Use**: Fly.io has a simple CLI and web interface, so you can deploy your challenges with just a few commands.
-- **Free Allowance**: You get $5 of free allowance every month and you can start for free.
+- **Free Allowance**: You don't need to pay if your usage is under $5 per month and you can start for free.
 
 ## Getting Started
 
