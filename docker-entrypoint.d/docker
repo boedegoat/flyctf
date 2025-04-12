@@ -2,10 +2,18 @@
 
 set -e
 
-echo "Setting up Docker data directory"
-mkdir -p /data/docker
+if [ ! -d "/data/docker" ]; then
+  echo "Setting up Docker data directory"
+  mkdir -p /data/docker
+else
+  echo "Docker data directory already exists"
+fi
 
-echo "Configuring ipv6 for docker"
-ip6tables-legacy -t nat -A POSTROUTING -s 2001:db8:1::/64 ! -o docker0 -j MASQUERADE
+if ! ip6tables-legacy -t nat -C POSTROUTING -s 2001:db8:1::/64 ! -o docker0 -j MASQUERADE 2>/dev/null; then
+  echo "Configuring ipv6 for docker"
+  ip6tables-legacy -t nat -A POSTROUTING -s 2001:db8:1::/64 ! -o docker0 -j MASQUERADE
+else
+  echo "IPv6 for docker already configured"
+fi
 
 echo "Done setting up docker!"

@@ -2,22 +2,27 @@
 
 set -e
 
-if [[ -d "docker-entrypoint.d" ]]
-then
-echo "Running docker-entrypoint.d files"
-/bin/run-parts docker-entrypoint.d
+if [[ -d "docker-entrypoint.d" ]]; then
+  echo "Running docker-entrypoint.d files in background"
+  /bin/run-parts docker-entrypoint.d &
+  ENTRYPOINT_PID=$!
 fi
 
-# Start Docker daemon and wait until it's responsive
-exec "$@" &  # Start Docker daemon in background
+exec "$@" &
+DOCKER_PID=$!
 
-# Wait for Docker socket to be ready
-for i in {1..30}; do
+if [[ -n "$ENTRYPOINT_PID" ]]; then
+  wait $ENTRYPOINT_PID
+  echo "Entrypoint scripts completed"
+fi
+
+sleep 2
+for i in {1..15}; do
   if docker info >/dev/null 2>&1; then
     echo "Docker is ready"
     break
   fi
-  echo "Waiting for Docker to start... ($i/30)"
+  echo "Waiting for Docker to start... ($i/15)"
   sleep 1
 done
 
