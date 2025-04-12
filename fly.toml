@@ -3,7 +3,7 @@
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'flyctf-challs'
+app = 'xsslab-challs'
 primary_region = 'sin'
 kill_signal = 'SIGINT'
 kill_timeout = '5s'
@@ -26,6 +26,20 @@ min_machines_running = 0
 
 [[services.ports]]
 port = 5000
+handlers = ['tls', 'http']
+
+[[services]]
+http_checks = []
+tcp_checks = []
+script_checks = []
+protocol = 'tcp'
+internal_port = 5001
+auto_stop_machines = 'stop'
+auto_start_machines = true
+min_machines_running = 0
+
+[[services.ports]]
+port = 5001
 handlers = ['tls', 'http']
 
 [[vm]]

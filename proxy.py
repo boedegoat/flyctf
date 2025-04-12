@@ -12,7 +12,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 CHALLENGES_DIR = Path("/app/challenges")
 CHALLENGE_CONFIG = {} # Stores {public_port: config_dict}
 
-# --- Utility Functions --- (Keep run_subprocess as before)
 async def run_subprocess(cmd, cwd=None):
     """Helper to run subprocesses and return stdout, stderr, code."""
     logging.debug(f"Running command: {' '.join(cmd)} in {cwd or '.'}")
@@ -29,7 +28,6 @@ async def run_subprocess(cmd, cwd=None):
         logging.warning(f"Command failed (code {proc.returncode}): {' '.join(cmd)}\nStderr: {stderr_str}")
     return stdout_str, stderr_str, proc.returncode
 
-# --- Challenge Discovery (MODIFIED) ---
 def find_challenges():
     """Scans the challenges directory using metadata files (challenge.yaml or challenge.yml)."""
     logging.info(f"Scanning for challenges in {CHALLENGES_DIR} using challenge.yaml or challenge.yml...")
@@ -41,11 +39,22 @@ def find_challenges():
             if item.name.startswith('.') or item.name == '__pycache__':
                 continue
 
-            compose_file = item / "docker-compose.yml"
-            metadata_file = None # Path object of the found metadata file
-            metadata_filename_used = None # String 'challenge.yaml' or 'challenge.yml'
+            compose_yml_path = item / "docker-compose.yml"
+            compose_yaml_path = item / "docker-compose.yaml"
 
-            # --- Check for challenge.yaml or challenge.yml ---
+            compose_file = None
+            compose_filename_used = None
+
+            if compose_yml_path.exists():
+                compose_file = compose_yml_path
+                compose_filename_used = "docker-compose.yml"
+            elif compose_yaml_path.exists():
+                compose_file = compose_yaml_path
+                compose_filename_used = "docker-compose.yaml"
+
+            metadata_file = None
+            metadata_filename_used = None
+
             metadata_yaml_path = item / "challenge.yaml"
             metadata_yml_path = item / "challenge.yml"
 
@@ -60,7 +69,7 @@ def find_challenges():
             # Proceed only if a metadata file AND a compose file were found
             if metadata_file and compose_file.exists():
                 challenge_folder_name = item.name
-                logging.debug(f"Found potential challenge '{challenge_folder_name}' with '{metadata_filename_used}' and '{compose_file.name}'")
+                logging.debug(f"Found potential challenge '{challenge_folder_name}' with '{metadata_filename_used}' and '{compose_filename_used}'")
                 try:
                     # --- Load Metadata (using the found metadata_file path) ---
                     with open(metadata_file, 'r') as f:
@@ -71,37 +80,62 @@ def find_challenges():
 
                     public_port = int(metadata['public_port'])
                     internal_port = int(metadata['internal_port'])
-                    # Use service_name from metadata if provided, else default to folder name
-                    service_name = metadata.get('service_name', challenge_folder_name)
-
+                    
                     # --- Validation ---
                     if not (1024 <= public_port <= 65535):
                         raise ValueError("Public port out of range")
                     if not (1 <= internal_port <= 65535):
                          raise ValueError("Internal port out of range")
 
-                    # --- Optional: Verify expose port in docker-compose.yml matches internal_port ---
+                    # --- Find service with "expose" directive in docker-compose file ---
+                    service_name = None
                     try:
-                         with open(compose_file, 'r') as f_compose:
-                              compose_data = yaml.safe_load(f_compose)
-                         # Check if service exists in compose file
-                         if service_name not in compose_data.get('services', {}):
-                              raise ValueError(f"Service name '{service_name}' not found in {compose_file.name}")
+                        with open(compose_file, 'r') as f_compose:
+                            compose_data = yaml.safe_load(f_compose)
+                        
+                        services = compose_data.get('services', {})
+                        # Look for services that have an "expose" section
+                        for svc_name, svc_data in services.items():
+                            if 'expose' in svc_data and svc_data.get('expose'):
+                                # Found a service with expose directive
+                                service_name = svc_name
+                                expose_ports = svc_data.get('expose', [])
+                                exposed_internal_ports = {int(p) for p in expose_ports}
+                                
+                                # Check if our internal_port is exposed
+                                if internal_port in exposed_internal_ports:
+                                    logging.info(f"Found service '{service_name}' with matching exposed port {internal_port}")
+                                    break
+                                else:
+                                    logging.warning(f"Service '{service_name}' has expose directive but not for port {internal_port}")
+                        
+                        # If no service with matching exposed port was found but we found services with expose,
+                        # use the first one
+                        if not service_name:
+                            for svc_name, svc_data in services.items():
+                                if 'expose' in svc_data and svc_data.get('expose'):
+                                    service_name = svc_name
+                                    logging.warning(f"No service with exposed port {internal_port} found, using first service with expose: '{service_name}'")
+                                    break
+                        
+                        # If still no service found, fall back to metadata or folder name
+                        if not service_name:
+                            service_name = metadata.get('service_name', challenge_folder_name)
+                            logging.warning(f"No service with expose directive found, falling back to '{service_name}'")
+                            
+                            # Make sure the service exists in the compose file
+                            if service_name not in services:
+                                raise ValueError(f"Service name '{service_name}' not found in {compose_file.name}")
+                            
+                            # Add warning about missing expose
+                            logging.warning(f"Challenge '{challenge_folder_name}': Service '{service_name}' does not have an expose directive for port {internal_port}. Connections might fail.")
 
-                         service_data = compose_data['services'][service_name]
-                         expose_ports = service_data.get('expose', [])
-                         exposed_internal_ports = {int(p) for p in expose_ports}
-
-                         if internal_port not in exposed_internal_ports:
-                              logging.warning(f"Challenge '{challenge_folder_name}': Internal port {internal_port} from {metadata_filename_used} "
-                                              f"is NOT listed in 'expose:' section ({exposed_internal_ports}) for service '{service_name}' in {compose_file.name}. "
-                                              f"Connections might fail.")
                     except FileNotFoundError:
                          raise ValueError(f"{compose_file.name} not found during verification.") # Should not happen here
                     except Exception as compose_err:
                          logging.warning(f"Challenge '{challenge_folder_name}': Could not verify expose port in {compose_file.name}. Error: {compose_err}")
-                         # Decide if you want to continue despite warning or skip
-
+                         # Fall back to metadata or folder name
+                         service_name = metadata.get('service_name', challenge_folder_name)
 
                     # --- Check for duplicate public port assignment before adding ---
                     if public_port in found_configs:
@@ -133,8 +167,7 @@ def find_challenges():
                 elif metadata_file and not compose_file.exists():
                      logging.warning(f"Skipping directory '{item.name}': Found {metadata_filename_used} but no {compose_file.name}.")
                 # If neither exists, no warning needed, just not a challenge dir
-
-
+    
     # Assign successfully parsed configs to the global dict
     global CHALLENGE_CONFIG
     CHALLENGE_CONFIG = found_configs
@@ -143,8 +176,6 @@ def find_challenges():
          logging.warning("No valid challenges found after scanning. Proxy will run but serve no challenges.")
          # No longer exiting here, allows adding challenges later maybe? Or user can decide if exit is needed.
 
-
-# --- Docker Interaction --- (Keep get_container_id, get_container_ip, is_service_running, start_service as before)
 async def get_container_id(config):
     """Get the container ID for the running service."""
     cmd = [
@@ -199,11 +230,13 @@ async def is_service_running(config):
 async def start_service(config):
     """Start the docker-compose service."""
     service_name = config['service_name']
-    public_port = next((p for p, c in CHALLENGE_CONFIG.items() if c['service_name'] == service_name), 'N/A') # Find public port for logging
-    logging.info(f"Starting service '{service_name}' for public port {public_port}...")
+    public_port = next((p for p, c in CHALLENGE_CONFIG.items() if c['service_name'] == service_name), 'N/A')
+    compose_file = config["compose_file"]
+    logging.info(f"Starting service '{service_name}' from {compose_file} for public port {public_port}...")
     cmd = [
-        "docker-compose", "-f", str(config["compose_file"]),
-        "up", "--build", "-d", "--remove-orphans", service_name
+        "docker-compose", "-f", str(compose_file),
+        "up", "--build", "-d", 
+        "--force-recreate", "--remove-orphans", "--progress=plain"
     ]
     _, stderr, returncode = await run_subprocess(cmd, cwd=config["dir"])
     if returncode != 0:
@@ -223,10 +256,8 @@ async def start_service(config):
          return False
 
 
-# --- Proxy Logic --- (Keep pipe_stream and handle_connection as before)
 async def pipe_stream(reader, writer, peer_name):
     """Reads from reader and writes to writer until EOF."""
-    # (Implementation unchanged)
     try:
         while not reader.at_eof():
             data = await reader.read(4096)
@@ -249,7 +280,6 @@ async def pipe_stream(reader, writer, peer_name):
 
 async def handle_connection(client_reader, client_writer):
     """Handles a new client connection."""
-    # (Implementation unchanged)
     peername = client_writer.get_extra_info('peername')
     sockname = client_writer.get_extra_info('sockname')
     listen_port = sockname[1] # This is the public port (e.g., 5000)
@@ -316,7 +346,6 @@ async def handle_connection(client_reader, client_writer):
                   except asyncio.CancelledError: pass
 
 
-# --- Main Server --- (Keep main function as before)
 async def main():
     """Starts the server listening on all configured challenge ports."""
     try:
