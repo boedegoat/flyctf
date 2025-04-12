@@ -8,10 +8,18 @@ echo "Running docker-entrypoint.d files"
 /bin/run-parts docker-entrypoint.d
 fi
 
-# Start the proxy in the background
-echo "Starting proxy server"
-python3 /app/proxy.py &
+# Start Docker daemon and wait until it's responsive
+exec "$@" &  # Start Docker daemon in background
 
-echo "Running $@"
+# Wait for Docker socket to be ready
+for i in {1..30}; do
+  if docker info >/dev/null 2>&1; then
+    echo "Docker is ready"
+    break
+  fi
+  echo "Waiting for Docker to start... ($i/30)"
+  sleep 1
+done
 
-exec "$@"
+# Now start the proxy
+python3 /app/proxy.py

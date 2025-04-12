@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for xsslab-challs on 2025-04-07T06:48:25+07:00
+# fly.toml app configuration file generated for flyctf-challs on 2025-04-12T17:32:05+07:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'xsslab-challs'
+app = 'flyctf-challs'
 primary_region = 'sin'
 kill_signal = 'SIGINT'
 kill_timeout = '5s'
@@ -15,9 +15,6 @@ source = 'data'
 destination = '/data'
 
 [[services]]
-http_checks = []
-tcp_checks = []
-script_checks = []
 protocol = 'tcp'
 internal_port = 5000
 auto_stop_machines = 'stop'
@@ -28,21 +25,7 @@ min_machines_running = 0
 port = 5000
 handlers = ['tls', 'http']
 
-[[services]]
-http_checks = []
-tcp_checks = []
-script_checks = []
-protocol = 'tcp'
-internal_port = 5001
-auto_stop_machines = 'stop'
-auto_start_machines = true
-min_machines_running = 0
-
-[[services.ports]]
-port = 5001
-handlers = ['tls', 'http']
-
 [[vm]]
-memory = '1gb'
+memory = '2gb'
 cpu_kind = 'shared'
-cpus = 1
+cpus = 2

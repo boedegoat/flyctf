@@ -1,388 +1,550 @@
 #!/usr/bin/env python3
+"""
+FlyCTF Challenge Proxy
+
+This module provides a TCP proxy service for CTF challenges that:
+1. Discovers challenges based on challenge.yaml/yml files
+2. Manages Docker containers for each challenge
+3. Ensures all services for a challenge are running before accepting connections
+4. Proxies inbound connections to the appropriate challenge container
+"""
 import asyncio
-import logging
-import sys
 import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+
 import yaml
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("proxy")
 
-# --- Configuration ---
+# Configuration constants
 CHALLENGES_DIR = Path("/app/challenges")
-CHALLENGE_CONFIG = {} # Stores {public_port: config_dict}
+MAX_STARTUP_TIME = 60  # Max seconds to wait for services to start
+CONN_TIMEOUT = 2.0  # Connection test timeout in seconds
+POLL_INTERVAL = 1.0  # Time between service readiness checks
 
-async def run_subprocess(cmd, cwd=None):
-    """Helper to run subprocesses and return stdout, stderr, code."""
-    logging.debug(f"Running command: {' '.join(cmd)} in {cwd or '.'}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd
-    )
-    stdout, stderr = await proc.communicate()
-    stdout_str = stdout.decode().strip()
-    stderr_str = stderr.decode().strip()
-    if proc.returncode != 0:
-        logging.warning(f"Command failed (code {proc.returncode}): {' '.join(cmd)}\nStderr: {stderr_str}")
-    return stdout_str, stderr_str, proc.returncode
 
-def find_challenges():
-    """Scans the challenges directory using metadata files (challenge.yaml or challenge.yml)."""
-    logging.info(f"Scanning for challenges in {CHALLENGES_DIR} using challenge.yaml or challenge.yml...")
-    found_configs = {} # Temp dict to check for duplicate public ports
+@dataclass
+class ServiceConfig:
+    """Configuration for a service within a challenge"""
+    name: str
+    container_id: Optional[str] = None
+    ip_address: Optional[str] = None
+    is_main: bool = False
+    accepts_connections: bool = False
+    last_error: Optional[str] = None
 
-    for item in CHALLENGES_DIR.iterdir():
-        if item.is_dir():
-            # Ignore common non-challenge dirs
-            if item.name.startswith('.') or item.name == '__pycache__':
-                continue
 
-            compose_yml_path = item / "docker-compose.yml"
-            compose_yaml_path = item / "docker-compose.yaml"
-
-            compose_file = None
-            compose_filename_used = None
-
-            if compose_yml_path.exists():
-                compose_file = compose_yml_path
-                compose_filename_used = "docker-compose.yml"
-            elif compose_yaml_path.exists():
-                compose_file = compose_yaml_path
-                compose_filename_used = "docker-compose.yaml"
-
-            metadata_file = None
-            metadata_filename_used = None
-
-            metadata_yaml_path = item / "challenge.yaml"
-            metadata_yml_path = item / "challenge.yml"
-
-            if metadata_yaml_path.exists():
-                metadata_file = metadata_yaml_path
-                metadata_filename_used = "challenge.yaml"
-            elif metadata_yml_path.exists():
-                metadata_file = metadata_yml_path
-                metadata_filename_used = "challenge.yml"
-            # --- ---
-
-            # Proceed only if a metadata file AND a compose file were found
-            if metadata_file and compose_file.exists():
-                challenge_folder_name = item.name
-                logging.debug(f"Found potential challenge '{challenge_folder_name}' with '{metadata_filename_used}' and '{compose_filename_used}'")
-                try:
-                    # --- Load Metadata (using the found metadata_file path) ---
-                    with open(metadata_file, 'r') as f:
-                        metadata = yaml.safe_load(f)
-
-                    if not isinstance(metadata, dict):
-                         raise ValueError(f"{metadata_filename_used} is not a valid dictionary.")
-
-                    public_port = int(metadata['public_port'])
-                    internal_port = int(metadata['internal_port'])
-                    
-                    # --- Validation ---
-                    if not (1024 <= public_port <= 65535):
-                        raise ValueError("Public port out of range")
-                    if not (1 <= internal_port <= 65535):
-                         raise ValueError("Internal port out of range")
-
-                    # --- Find service with "expose" directive in docker-compose file ---
-                    service_name = None
-                    try:
-                        with open(compose_file, 'r') as f_compose:
-                            compose_data = yaml.safe_load(f_compose)
-                        
-                        services = compose_data.get('services', {})
-                        # Look for services that have an "expose" section
-                        for svc_name, svc_data in services.items():
-                            if 'expose' in svc_data and svc_data.get('expose'):
-                                # Found a service with expose directive
-                                service_name = svc_name
-                                expose_ports = svc_data.get('expose', [])
-                                exposed_internal_ports = {int(p) for p in expose_ports}
-                                
-                                # Check if our internal_port is exposed
-                                if internal_port in exposed_internal_ports:
-                                    logging.info(f"Found service '{service_name}' with matching exposed port {internal_port}")
-                                    break
-                                else:
-                                    logging.warning(f"Service '{service_name}' has expose directive but not for port {internal_port}")
-                        
-                        # If no service with matching exposed port was found but we found services with expose,
-                        # use the first one
-                        if not service_name:
-                            for svc_name, svc_data in services.items():
-                                if 'expose' in svc_data and svc_data.get('expose'):
-                                    service_name = svc_name
-                                    logging.warning(f"No service with exposed port {internal_port} found, using first service with expose: '{service_name}'")
-                                    break
-                        
-                        # If still no service found, fall back to metadata or folder name
-                        if not service_name:
-                            service_name = metadata.get('service_name', challenge_folder_name)
-                            logging.warning(f"No service with expose directive found, falling back to '{service_name}'")
-                            
-                            # Make sure the service exists in the compose file
-                            if service_name not in services:
-                                raise ValueError(f"Service name '{service_name}' not found in {compose_file.name}")
-                            
-                            # Add warning about missing expose
-                            logging.warning(f"Challenge '{challenge_folder_name}': Service '{service_name}' does not have an expose directive for port {internal_port}. Connections might fail.")
-
-                    except FileNotFoundError:
-                         raise ValueError(f"{compose_file.name} not found during verification.") # Should not happen here
-                    except Exception as compose_err:
-                         logging.warning(f"Challenge '{challenge_folder_name}': Could not verify expose port in {compose_file.name}. Error: {compose_err}")
-                         # Fall back to metadata or folder name
-                         service_name = metadata.get('service_name', challenge_folder_name)
-
-                    # --- Check for duplicate public port assignment before adding ---
-                    if public_port in found_configs:
-                         logging.error(f"Duplicate public port {public_port} defined by both '{found_configs[public_port]['challenge_folder_name']}' (using {found_configs[public_port]['metadata_filename_used']}) and '{challenge_folder_name}' (using {metadata_filename_used}). Skipping '{challenge_folder_name}'.")
-                         continue # Skip this challenge
-
-                    # --- Store valid configuration ---
-                    config_data = {
-                        "dir": item,
-                        "compose_file": compose_file,
-                        "service_name": service_name,
-                        "internal_port": internal_port,
-                        "challenge_folder_name": challenge_folder_name, # Store original folder name
-                        "metadata_filename_used": metadata_filename_used # Store which filename was found
-                    }
-                    found_configs[public_port] = config_data # Add to temp dict first
-                    logging.info(f"Discovered challenge '{challenge_folder_name}' using '{metadata_filename_used}': Public Port {public_port} -> Service '{service_name}' -> Internal Port {internal_port}")
-
-                # --- Catch errors during parsing/validation for this specific challenge ---
-                except (ValueError, yaml.YAMLError, KeyError, TypeError) as e:
-                     logging.warning(f"Skipping challenge in folder '{challenge_folder_name}': Could not parse valid config from {metadata_filename_used} or related files. Error: {e}")
-                except FileNotFoundError as e:
-                     logging.warning(f"Skipping challenge in folder '{challenge_folder_name}': File not found during processing. Error: {e}")
-
-            # --- Log warnings for potential misconfigurations ---
-            elif item.name != '__pycache__': # Avoid logging for python cache dirs
-                if not metadata_file and compose_file.exists():
-                     logging.warning(f"Skipping directory '{item.name}': Found {compose_file.name} but no challenge.yaml or challenge.yml.")
-                elif metadata_file and not compose_file.exists():
-                     logging.warning(f"Skipping directory '{item.name}': Found {metadata_filename_used} but no {compose_file.name}.")
-                # If neither exists, no warning needed, just not a challenge dir
+@dataclass
+class ChallengeConfig:
+    """Configuration for a challenge"""
+    public_port: int
+    internal_port: int
+    service_name: str
+    challenge_dir: Path
+    compose_file: Path
+    challenge_name: str
+    services: Dict[str, ServiceConfig] = None
     
-    # Assign successfully parsed configs to the global dict
-    global CHALLENGE_CONFIG
-    CHALLENGE_CONFIG = found_configs
+    def __post_init__(self):
+        """Initialize services dict if not provided"""
+        if self.services is None:
+            self.services = {}
+            # Add main service
+            self.services[self.service_name] = ServiceConfig(
+                name=self.service_name, 
+                is_main=True
+            )
 
-    if not CHALLENGE_CONFIG:
-         logging.warning("No valid challenges found after scanning. Proxy will run but serve no challenges.")
-         # No longer exiting here, allows adding challenges later maybe? Or user can decide if exit is needed.
 
-async def get_container_id(config):
-    """Get the container ID for the running service."""
-    cmd = [
-        "docker-compose", "-f", str(config["compose_file"]),
-        "ps", "-q", config["service_name"]
-    ]
-    stdout, _, returncode = await run_subprocess(cmd, cwd=config["dir"])
-    if returncode == 0 and stdout:
-        ids = stdout.splitlines()
-        return ids[0] if ids else None # Return first ID if exists
-    return None
+class DockerHelper:
+    """Helper class for Docker operations"""
 
-async def get_container_ip(container_id):
-    """Inspect the container to get its primary IP address."""
-    if not container_id:
+    @staticmethod
+    async def run_command(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[str, str, int]:
+        """Run a command and return stdout, stderr, and return code"""
+        logger.debug(f"Running command: {' '.join(cmd)} in {cwd or '.'}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+        stdout, stderr = await proc.communicate()
+        
+        stdout_str = stdout.decode().strip() if stdout else ""
+        stderr_str = stderr.decode().strip() if stderr else ""
+        
+        if proc.returncode != 0:
+            logger.warning(
+                f"Command failed (code {proc.returncode}): {' '.join(cmd)}\nStderr: {stderr_str}"
+            )
+            
+        return stdout_str, stderr_str, proc.returncode
+
+    @classmethod
+    async def get_container_id(cls, challenge: ChallengeConfig, service_name: str) -> Optional[str]:
+        """Get container ID for a service in a challenge"""
+        cmd = [
+            "docker-compose", 
+            "-f", 
+            str(challenge.compose_file),
+            "ps", 
+            "-q", 
+            service_name
+        ]
+        stdout, _, returncode = await cls.run_command(cmd, cwd=challenge.challenge_dir)
+        
+        if returncode == 0 and stdout:
+            container_ids = stdout.splitlines()
+            return container_ids[0] if container_ids else None
+            
         return None
-    cmd = ["docker", "inspect", container_id]
-    stdout, _, returncode = await run_subprocess(cmd)
-    if returncode == 0 and stdout:
+
+    @classmethod
+    async def get_container_ip(cls, container_id: str) -> Optional[str]:
+        """Get IP address for a container"""
+        if not container_id:
+            return None
+            
+        cmd = ["docker", "inspect", container_id]
+        stdout, _, returncode = await cls.run_command(cmd)
+        
+        if returncode != 0 or not stdout:
+            return None
+            
         try:
             data = json.loads(stdout)
-            if data:
-                networks = data[0].get("NetworkSettings", {}).get("Networks", {})
-                if networks:
-                    ip_address = None
-                    # Prioritize common network names, then fallback
-                    for net_name, net_settings in networks.items():
-                         if "bridge" in net_name or "default" in net_name:
-                              ip_address = net_settings.get("IPAddress")
-                              if ip_address: break
-                    if not ip_address: # Fallback to first available IP
-                         first_network = next(iter(networks.values()), None)
-                         if first_network: ip_address = first_network.get("IPAddress")
-
+            if not data:
+                return None
+                
+            networks = data[0].get("NetworkSettings", {}).get("Networks", {})
+            if not networks:
+                return None
+                
+            # Try to find a suitable network in priority order
+            ip_address = None
+            
+            # First try bridge or default networks
+            for net_name, net_data in networks.items():
+                if "bridge" in net_name.lower() or "default" in net_name.lower():
+                    ip_address = net_data.get("IPAddress")
                     if ip_address:
-                        logging.debug(f"Found IP {ip_address} for container {container_id}")
-                        return ip_address
-        except (json.JSONDecodeError, IndexError, KeyError, StopIteration, TypeError) as e:
-            logging.error(f"Failed to parse docker inspect output for {container_id}: {e}")
-    logging.warning(f"Could not determine IP address for container {container_id}")
-    return None
+                        break
+            
+            # If not found, use the first network with an IP
+            if not ip_address:
+                for net_data in networks.values():
+                    ip_address = net_data.get("IPAddress")
+                    if ip_address:
+                        break
+            
+            return ip_address
+            
+        except (json.JSONDecodeError, IndexError, KeyError) as e:
+            logger.error(f"Failed to parse docker inspect output: {e}")
+            return None
+
+    @classmethod
+    async def start_services(cls, challenge: ChallengeConfig) -> bool:
+        """Start all services for a challenge"""
+        cmd = [
+            "docker-compose",
+            "-f", 
+            str(challenge.compose_file),
+            "up", 
+            "--build", 
+            "-d", 
+            "--remove-orphans",
+        ]
+        
+        _, stderr, returncode = await cls.run_command(cmd, cwd=challenge.challenge_dir)
+        
+        if returncode != 0:
+            logger.error(f"Failed to start services for {challenge.challenge_name}: {stderr}")
+            return False
+            
+        logger.info(f"Services start command issued for challenge {challenge.challenge_name}")
+        return True
 
 
-async def is_service_running(config):
-    """Check if the service's container is running and get its IP."""
-    container_id = await get_container_id(config)
-    if container_id:
-         ip = await get_container_ip(container_id)
-         return ip is not None
-    return False
+class ChallengeManager:
+    """Manages challenge discovery, startup, and readiness checking"""
+    
+    challenge_configs: Dict[int, ChallengeConfig] = {}
+    
+    @classmethod
+    async def discover_challenges(cls) -> None:
+        """Find available challenges in the challenges directory"""
+        logger.info(f"Discovering challenges in {CHALLENGES_DIR}...")
+        found_configs: Dict[int, ChallengeConfig] = {}
+        
+        if not CHALLENGES_DIR.exists():
+            logger.error(f"Challenges directory {CHALLENGES_DIR} does not exist!")
+            return
+        
+        for item in CHALLENGES_DIR.iterdir():
+            if not item.is_dir() or item.name.startswith(".") or item.name == "__pycache__":
+                continue
+            
+            # Look for docker-compose file
+            compose_file = item / "docker-compose.yml"
+            if not compose_file.exists():
+                compose_file = item / "docker-compose.yaml"
+                if not compose_file.exists():
+                    logger.debug(f"Skipping {item.name}: No docker-compose file found")
+                    continue
+            
+            # Look for challenge metadata file
+            metadata_file = item / "challenge.yaml"
+            if not metadata_file.exists():
+                metadata_file = item / "challenge.yml"
+                if not metadata_file.exists():
+                    logger.debug(f"Skipping {item.name}: No challenge metadata file found")
+                    continue
+            
+            # Parse metadata
+            try:
+                with open(metadata_file, 'r') as f:
+                    metadata = yaml.safe_load(f)
+                
+                if not isinstance(metadata, dict):
+                    logger.warning(f"Skipping {item.name}: Invalid metadata format")
+                    continue
+                
+                public_port = int(metadata.get('public_port', 0))
+                internal_port = int(metadata.get('internal_port', 0))
+                
+                if not (1024 <= public_port <= 65535):
+                    logger.warning(f"Skipping {item.name}: Invalid public port {public_port}")
+                    continue
+                    
+                if not (1 <= internal_port <= 65535):
+                    logger.warning(f"Skipping {item.name}: Invalid internal port {internal_port}")
+                    continue
+                
+                # Find service with exposed port
+                service_name = None
+                try:
+                    with open(compose_file, 'r') as f:
+                        compose_data = yaml.safe_load(f)
+                    
+                    services = compose_data.get('services', {})
+                    
+                    # First try to find a service exposing the required port
+                    for svc_name, svc_data in services.items():
+                        if 'expose' in svc_data and svc_data.get('expose'):
+                            expose_ports = {int(p) for p in svc_data.get('expose', [])}
+                            if internal_port in expose_ports:
+                                service_name = svc_name
+                                break
+                    
+                    # If not found, use any service with 'expose' directive
+                    if not service_name:
+                        for svc_name, svc_data in services.items():
+                            if 'expose' in svc_data and svc_data.get('expose'):
+                                service_name = svc_name
+                                logger.warning(f"Challenge {item.name}: No service exposes port {internal_port}, using {svc_name}")
+                                break
+                    
+                    # If still not found, use metadata or fallback to first service
+                    if not service_name:
+                        service_name = metadata.get('service_name')
+                        if not service_name or service_name not in services:
+                            if services:
+                                service_name = next(iter(services.keys()))
+                                logger.warning(f"Challenge {item.name}: No service specified, using first service {service_name}")
+                            else:
+                                logger.warning(f"Skipping {item.name}: No services defined in compose file")
+                                continue
 
-async def start_service(config):
-    """Start the docker-compose service."""
-    service_name = config['service_name']
-    public_port = next((p for p, c in CHALLENGE_CONFIG.items() if c['service_name'] == service_name), 'N/A')
-    compose_file = config["compose_file"]
-    logging.info(f"Starting service '{service_name}' from {compose_file} for public port {public_port}...")
-    cmd = [
-        "docker-compose", "-f", str(compose_file),
-        "up", "--build", "-d", 
-        "--force-recreate", "--remove-orphans", "--progress=plain"
-    ]
-    _, stderr, returncode = await run_subprocess(cmd, cwd=config["dir"])
-    if returncode != 0:
-        logging.error(f"Failed to start service '{service_name}'. Error: {stderr}")
+                    # Check for duplicate public ports
+                    if public_port in found_configs:
+                        existing = found_configs[public_port].challenge_name
+                        logger.error(f"Duplicate public port {public_port} for challenges '{existing}' and '{item.name}'. Skipping '{item.name}'.")
+                        continue
+                    
+                    # Create challenge config
+                    challenge_config = ChallengeConfig(
+                        public_port=public_port,
+                        internal_port=internal_port,
+                        service_name=service_name,
+                        challenge_dir=item,
+                        compose_file=compose_file,
+                        challenge_name=item.name,
+                    )
+                    
+                    # Add all services from compose file
+                    for svc_name in services.keys():
+                        is_main = (svc_name == service_name)
+                        challenge_config.services[svc_name] = ServiceConfig(
+                            name=svc_name,
+                            is_main=is_main,
+                        )
+                    
+                    found_configs[public_port] = challenge_config
+                    logger.info(f"Discovered challenge '{item.name}': Public Port {public_port} -> Service '{service_name}' -> Internal Port {internal_port}")
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing compose file for {item.name}: {e}")
+                    continue
+                    
+            except Exception as e:
+                logger.warning(f"Error processing challenge {item.name}: {e}")
+                continue
+        
+        cls.challenge_configs = found_configs
+        
+        if not cls.challenge_configs:
+            logger.warning("No valid challenges found")
+        else:
+            logger.info(f"Discovered {len(cls.challenge_configs)} valid challenges")
+
+    @classmethod
+    async def check_challenge_readiness(cls, challenge: ChallengeConfig) -> bool:
+        """
+        Check if all services in a challenge are ready
+        Returns True if all services are running with IPs and the main service accepts connections
+        """
+        all_ready = True
+        services_ready = 0
+        total_services = len(challenge.services)
+        
+        for service_name, service in challenge.services.items():
+            # Get container ID
+            container_id = await DockerHelper.get_container_id(challenge, service_name)
+            if not container_id:
+                service.container_id = None
+                service.ip_address = None
+                service.accepts_connections = False
+                service.last_error = "Container not running"
+                all_ready = False
+                continue
+            
+            service.container_id = container_id
+            
+            # Get container IP
+            ip_address = await DockerHelper.get_container_ip(container_id)
+            if not ip_address:
+                service.ip_address = None
+                service.accepts_connections = False
+                service.last_error = "No IP address assigned"
+                all_ready = False
+                continue
+                
+            service.ip_address = ip_address
+            
+            # For main service, check port connectivity
+            if service.is_main:
+                try:
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(ip_address, challenge.internal_port),
+                        timeout=CONN_TIMEOUT
+                    )
+                    writer.close()
+                    await writer.wait_closed()
+                    service.accepts_connections = True
+                    service.last_error = None
+                except (ConnectionRefusedError, asyncio.TimeoutError, OSError) as e:
+                    service.accepts_connections = False
+                    service.last_error = f"Connection test failed: {e}"
+                    all_ready = False
+                    continue
+            
+            services_ready += 1
+        
+        if all_ready:
+            logger.info(f"Challenge '{challenge.challenge_name}' is fully ready with {total_services} services")
+        else:
+            logger.debug(f"Challenge '{challenge.challenge_name}': {services_ready}/{total_services} services ready")
+            
+        return all_ready
+
+    @classmethod
+    async def ensure_challenge_ready(cls, challenge: ChallengeConfig) -> bool:
+        """
+        Ensure the challenge is ready, starting it if necessary
+        Returns True if the challenge is ready after the operation
+        """
+        # First check if it's already ready
+        if await cls.check_challenge_readiness(challenge):
+            return True
+        
+        # If not ready, try to start services
+        logger.info(f"Starting services for challenge '{challenge.challenge_name}'...")
+        if not await DockerHelper.start_services(challenge):
+            logger.error(f"Failed to start services for challenge '{challenge.challenge_name}'")
+            return False
+        
+        # Wait for services to become ready
+        start_time = time.time()
+        while (time.time() - start_time) < MAX_STARTUP_TIME:
+            if await cls.check_challenge_readiness(challenge):
+                elapsed = int(time.time() - start_time)
+                logger.info(f"Challenge '{challenge.challenge_name}' ready after {elapsed}s")
+                return True
+            
+            await asyncio.sleep(POLL_INTERVAL)
+        
+        # Timeout reached
+        logger.error(f"Challenge '{challenge.challenge_name}' not ready after {MAX_STARTUP_TIME}s")
         return False
 
-    logging.info(f"Service '{service_name}' start command issued. Waiting briefly...")
-    await asyncio.sleep(3)
 
-    container_id = await get_container_id(config)
-    ip_address = await get_container_ip(container_id)
-    if ip_address:
-         logging.info(f"Service '{service_name}' confirmed running with IP {ip_address}.")
-         return True
-    else:
-         logging.error(f"Service '{service_name}' failed to become ready after start command.")
-         return False
+class ProxyService:
+    """Handles TCP proxying between clients and challenge services"""
+    
+    @staticmethod
+    async def pipe_stream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
+                         description: str) -> None:
+        """Pipe data from reader to writer"""
+        try:
+            while not reader.at_eof():
+                data = await reader.read(8192)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError) as e:
+            logger.debug(f"{description}: Connection closed: {e}")
+        except Exception as e:
+            logger.error(f"{description}: Error piping data: {e}")
+        finally:
+            if not writer.is_closing():
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception as e:
+                    logger.debug(f"{description}: Error closing writer: {e}")
 
-
-async def pipe_stream(reader, writer, peer_name):
-    """Reads from reader and writes to writer until EOF."""
-    try:
-        while not reader.at_eof():
-            data = await reader.read(4096)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
-    except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError) as e:
-        logging.debug(f"Connection closed/reset for {peer_name}: {e}")
-    except Exception as e:
-        logging.error(f"Error piping stream for {peer_name}: {e}")
-    finally:
-        if writer and not writer.is_closing():
-             try:
-                writer.close()
-                await writer.wait_closed()
-             except Exception as close_e:
-                 logging.debug(f"Error closing writer for {peer_name}: {close_e}")
-
-
-async def handle_connection(client_reader, client_writer):
-    """Handles a new client connection."""
-    peername = client_writer.get_extra_info('peername')
-    sockname = client_writer.get_extra_info('sockname')
-    listen_port = sockname[1] # This is the public port (e.g., 5000)
-    logging.info(f"Received connection from {peername} on public port {listen_port}")
-
-    if listen_port not in CHALLENGE_CONFIG:
-        logging.error(f"No challenge configured for port {listen_port}. Closing connection.")
-        client_writer.close()
-        await client_writer.wait_closed()
-        return
-
-    config = CHALLENGE_CONFIG[listen_port]
-    service_name = config['service_name']
-
-    container_id = await get_container_id(config)
-    target_ip = await get_container_ip(container_id)
-
-    if not target_ip:
-        logging.info(f"Service '{service_name}' not running or has no IP. Attempting to start...")
-        if not await start_service(config):
-            logging.error(f"Could not start service '{service_name}' for port {listen_port}. Closing connection.")
+    @classmethod
+    async def handle_connection(cls, client_reader: asyncio.StreamReader, 
+                              client_writer: asyncio.StreamWriter) -> None:
+        """Handle incoming client connection"""
+        peername = client_writer.get_extra_info('peername')
+        sockname = client_writer.get_extra_info('sockname')
+        listen_port = sockname[1]
+        
+        logger.info(f"Received connection from {peername} on port {listen_port}")
+        
+        # Check if we have a challenge for this port
+        if listen_port not in ChallengeManager.challenge_configs:
+            logger.error(f"No challenge configured for port {listen_port}")
             client_writer.close()
             await client_writer.wait_closed()
             return
-        else:
-             container_id = await get_container_id(config)
-             target_ip = await get_container_ip(container_id)
-             if not target_ip:
-                 logging.error(f"Service '{service_name}' started but failed to get IP for port {listen_port}. Closing connection.")
-                 client_writer.close()
-                 await client_writer.wait_closed()
-                 return
-             logging.info(f"Service '{service_name}' for port {listen_port} is now running.")
-    else:
-         logging.info(f"Service '{service_name}' for port {listen_port} already running with IP {target_ip}.")
+        
+        challenge = ChallengeManager.challenge_configs[listen_port]
+        
+        # Ensure the challenge is ready
+        if not await ChallengeManager.ensure_challenge_ready(challenge):
+            logger.error(f"Failed to prepare challenge '{challenge.challenge_name}' for connection")
+            client_writer.close()
+            await client_writer.wait_closed()
+            return
+        
+        # Get main service details
+        main_service = challenge.services[challenge.service_name]
+        if not main_service.ip_address or not main_service.accepts_connections:
+            logger.error(f"Main service for '{challenge.challenge_name}' is not accepting connections")
+            client_writer.close()
+            await client_writer.wait_closed()
+            return
+        
+        # Connect to target
+        target_ip = main_service.ip_address
+        target_port = challenge.internal_port
+        
+        try:
+            logger.info(f"Proxying {peername} -> {target_ip}:{target_port} for challenge '{challenge.challenge_name}'")
+            target_reader, target_writer = await asyncio.open_connection(target_ip, target_port)
+            
+            # Set up bidirectional proxy
+            client_to_target = asyncio.create_task(
+                cls.pipe_stream(client_reader, target_writer, f"{peername} -> {target_ip}:{target_port}")
+            )
+            target_to_client = asyncio.create_task(
+                cls.pipe_stream(target_reader, client_writer, f"{target_ip}:{target_port} -> {peername}")
+            )
+            
+            # Wait for either direction to complete
+            done, pending = await asyncio.wait(
+                [client_to_target, target_to_client],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                    
+        except ConnectionRefusedError:
+            logger.error(f"Connection refused to {target_ip}:{target_port}")
+        except Exception as e:
+            logger.error(f"Error proxying to {target_ip}:{target_port}: {e}")
+        finally:
+            logger.info(f"Connection from {peername} closed")
+            # Ensure all connections are properly closed
+            for writer in [w for w in [client_writer, locals().get('target_writer')] 
+                          if w and not w.is_closing()]:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
-    target_port = config["internal_port"]
-    target_reader, target_writer = None, None
-    try:
-        logging.info(f"Proxying {peername} -> {target_ip}:{target_port} for challenge '{config['challenge_folder_name']}' (service: {service_name})")
-        target_reader, target_writer = await asyncio.open_connection(target_ip, target_port)
 
-        client_to_target = asyncio.create_task(pipe_stream(client_reader, target_writer, f"{peername} -> target"))
-        target_to_client = asyncio.create_task(pipe_stream(target_reader, client_writer, f"target -> {peername}"))
-        await asyncio.wait([client_to_target, target_to_client], return_when=asyncio.FIRST_COMPLETED)
-
-    except ConnectionRefusedError:
-         logging.error(f"Connection refused connecting to {target_ip}:{target_port}. Is service '{service_name}' running & listening internally?")
-    except OSError as e:
-         logging.error(f"OS error connecting or proxying to {target_ip}:{target_port}: {e}")
-    except Exception as e:
-        logging.error(f"Proxy error for port {listen_port} -> {target_ip}:{target_port}: {e}")
-    finally:
-        logging.info(f"Closing connection from {peername} on port {listen_port}")
-        writers_to_close = [w for w in (target_writer, client_writer) if w and not w.is_closing()]
-        for writer in writers_to_close:
-            try: writer.close(); await writer.wait_closed()
-            except Exception: pass
-        tasks_to_cancel = [t for t in [locals().get('client_to_target', None), locals().get('target_to_client', None)] if t and not t.done()]
-        for task in tasks_to_cancel:
-              if task:
-                  task.cancel()
-                  try: await task
-                  except asyncio.CancelledError: pass
-
-
-async def main():
-    """Starts the server listening on all configured challenge ports."""
-    try:
-        import yaml
-    except ImportError:
-        logging.error("PyYAML is not available. Ensure 'py3-yaml' is in apk add command in Dockerfile.")
-        sys.exit(1)
-
-    find_challenges() # Discover challenges using the new method
-
+async def main() -> None:
+    """Main entry point for the proxy service"""
+    logger.info("Starting FlyCTF proxy service")
+    
+    # Discover challenges
+    await ChallengeManager.discover_challenges()
+    
+    if not ChallengeManager.challenge_configs:
+        logger.warning("No challenges found. Proxy will run but serve no challenges.")
+    
+    # Start servers for each challenge
     servers = []
-    for port in CHALLENGE_CONFIG.keys():
+    for port, challenge in ChallengeManager.challenge_configs.items():
         try:
             server = await asyncio.start_server(
-                handle_connection, '0.0.0.0', port)
+                ProxyService.handle_connection,
+                '0.0.0.0',
+                port
+            )
             servers.append(server)
-            logging.info(f"Proxy listening on 0.0.0.0:{port}")
+            logger.info(f"Listening on 0.0.0.0:{port} for challenge '{challenge.challenge_name}'")
         except OSError as e:
-             logging.error(f"Failed to bind to public port {port}: {e}.")
-        except Exception as e:
-             logging.error(f"Failed to start server on port {port}: {e}")
-
-    if not servers:
-         if CHALLENGE_CONFIG:
-              logging.error("No proxy servers could be started, although challenges were configured. Exiting.")
-              sys.exit(1)
-         else:
-              logging.warning("No challenges configured or found. Proxy running but serving nothing.")
-
+            logger.error(f"Failed to bind to port {port}: {e}")
+    
     if servers:
-        await asyncio.gather(*(s.serve_forever() for s in servers))
+        # Wait for all servers to complete (they run forever)
+        await asyncio.gather(*(server.serve_forever() for server in servers))
     else:
-        await asyncio.Event().wait() # Keep container running even if no challenges loaded
+        # Keep the application running even if no servers started
+        logger.warning("No servers started. Waiting indefinitely.")
+        await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Proxy shutting down.")
+        logger.info("Proxy shutting down")
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {e}", exc_info=True)
+        sys.exit(1)

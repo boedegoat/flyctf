@@ -20,7 +20,6 @@ module.exports = {
 					name: 'flag',
 					httpOnly: false,
 					value: CONFIG.APPFLAG,
-					path: '/',
 					url: CONFIG.APPURL,
 				},
 			])

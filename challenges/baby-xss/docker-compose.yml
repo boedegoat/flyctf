@@ -18,6 +18,8 @@ services:
       context: src
     environment:
       - PORT=80
+    networks:
+      - internal
   bot:
     build:
       context: bot
