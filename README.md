@@ -34,8 +34,8 @@ This repository contains a template for deploying CTF challenges on Fly.io, whic
     services:
         app:
             build: .
-            ports:
-                - '80:80'
+            expose:
+                - '80'
     ```
 
 1. Create `challenge.yml` file with the following structure:

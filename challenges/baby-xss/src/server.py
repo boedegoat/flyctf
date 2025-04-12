@@ -1,11 +1,8 @@
 import os
 from flask import Flask, request
-from dotenv import load_dotenv
-
-load_dotenv()
 
 app = Flask(__name__)
-port = os.getenv('PORT', 80)
+port = int(os.getenv('PORT', 80))
 
 @app.route('/')
 def hello():
