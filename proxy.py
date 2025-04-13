@@ -31,7 +31,7 @@ logger = logging.getLogger("proxy")
 CHALLENGES_DIR = Path("/app/challenges")
 MAX_STARTUP_TIME = 60  # Max seconds to wait for services to start
 CONN_TIMEOUT = 2.0  # Connection test timeout in seconds
-POLL_INTERVAL = 1.0  # Time between service readiness checks
+POLL_INTERVAL = 0.2  # Time between service readiness checks
 
 
 @dataclass

@@ -2,29 +2,34 @@
 
 set -e
 
-if [[ -d "docker-entrypoint.d" ]]; then
-  echo "Running docker-entrypoint.d files in background"
-  /bin/run-parts docker-entrypoint.d &
-  ENTRYPOINT_PID=$!
-fi
-
+# Start Docker in background immediately
 exec "$@" &
 DOCKER_PID=$!
 
-if [[ -n "$ENTRYPOINT_PID" ]]; then
-  wait $ENTRYPOINT_PID
-  echo "Entrypoint scripts completed"
+mkdir -p ${DOCKER_TMPDIR:-/data/docker/tmp}
+
+if [[ -d "docker-entrypoint.d" ]]; then
+  echo "Running docker-entrypoint.d files in parallel"
+  find docker-entrypoint.d -type f -executable | grep -v "sysctl" | sort | xargs -P 4 -I {} bash -c '{} &'
+  if [ -x docker-entrypoint.d/sysctl ]; then
+    docker-entrypoint.d/sysctl
+  fi
 fi
 
-sleep 2
-for i in {1..15}; do
-  if docker info >/dev/null 2>&1; then
-    echo "Docker is ready"
+echo "Waiting for Docker to start..."
+for i in {1..30}; do
+  if docker ps >/dev/null 2>&1; then
+    echo "Docker is ready after $i checks"
     break
   fi
-  echo "Waiting for Docker to start... ($i/15)"
-  sleep 1
+  sleep 0.2
 done
 
-# Now start the proxy
-python3 /app/proxy.py
+# Set process priorities
+renice -n -10 -p $DOCKER_PID >/dev/null 2>&1 || true
+ionice -c 1 -n 0 -p $DOCKER_PID >/dev/null 2>&1 || true
+
+python3 /app/proxy.py &
+PROXY_PID=$!
+
+wait $PROXY_PID
