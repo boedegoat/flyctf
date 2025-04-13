@@ -43,4 +43,11 @@ sysctl net.ipv4.tcp_fastopen=3
 sysctl net.ipv4.tcp_tw_reuse=1
 sysctl net.ipv4.ip_local_port_range="1024 65535"
 
+# Add conntrack optimizations to fix delete errors
+sysctl net.netfilter.nf_conntrack_max=1048576
+sysctl net.nf_conntrack_max=1048576 2>/dev/null || true
+sysctl net.netfilter.nf_conntrack_tcp_timeout_established=86400
+sysctl net.netfilter.nf_conntrack_tcp_timeout_close_wait=15
+sysctl net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30
+
 echo "All sysctl settings applied successfully"
